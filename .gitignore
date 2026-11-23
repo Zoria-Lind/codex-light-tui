@@ -1,0 +1,7 @@
+.venv/
+.schema/
+.ui-state.json*
+.ui-state.tmp
+.pasted-images/
+.shared-runtime/
+__pycache__/
