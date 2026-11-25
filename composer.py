@@ -11,10 +11,32 @@ from textual.widgets import TextArea
 
 
 class Composer(TextArea):
+    def __init__(self, *, submit=None, menu_key=None, **kwargs):
+        super().__init__(**kwargs)
+        self.submit_message = submit
+        self.menu_key = menu_key
+
     async def _on_key(self, event):
         if self.read_only:
             return
         key = event.key
+        if key in {"up", "down", "escape"}:
+            handler = self.menu_key if self.submit_message is not None else self.app.slash_menu_key
+            if handler is not None and handler(key):
+                event.stop()
+                event.prevent_default()
+                return
+        if self.submit_message is not None:
+            if key in {"enter", "ctrl+enter", "shift+enter", "ctrl+j"}:
+                event.stop()
+                event.prevent_default()
+                if key in {"enter", "ctrl+enter"}:
+                    self.submit_message()
+                else:
+                    self.insert_paste("\n")
+                return
+            await super()._on_key(event)
+            return
         if key in {"enter", "shift+enter", "ctrl+j", "ctrl+alt+v", "ctrl+v"}:
             event.stop()
             event.prevent_default()

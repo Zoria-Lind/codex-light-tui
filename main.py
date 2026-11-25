@@ -18,15 +18,17 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.theme import Theme
-from textual.widgets import Button, Input, Label, Static, TextArea, Tree
+from textual.widgets import Button, Input, Label, OptionList, Static, TextArea, Tree
+from textual.widgets.option_list import Option
 from textual.worker import WorkerCancelled
 
 from backend import Backend, CodexError, ConnectionInterrupted, codex_environment
+from btw import BtwPanel
 from composer import Composer, copy_clipboard, read_clipboard
-from dialogs import Approval, PathDialog, Picker, ProjectDialog, Questions, Settings
+from dialogs import Approval, PathDialog, Picker, ProjectDialog, Questions, Settings, StatusDialog
 from shared_state import RESIDENT_TASK, STATUS, read_endpoint
 from sidebar import catalog, desktop_preferences
-from transcript import ToolBlock, markdown, message_block, submitted_text, tool_detail
+from transcript import ToolBlock, TranscriptPane, markdown, message_block, submitted_text, tool_detail
 
 
 STATE_PATH = Path(__file__).with_name(".ui-state.json")
@@ -38,6 +40,7 @@ THREAD_LIST_OPTIONS = {
     "modelProviders": [], "sourceKinds": ["cli", "vscode", "appServer", "exec"],
 }
 QUESTION_CONFIG = {"features.default_mode_request_user_input": True}
+SLASH_COMMANDS = {"/compact": "压缩当前上下文", "/btw": "打开右侧支线", "/status": "查看状态与用量"}
 FOREST = Theme(
     name="codex-forest", primary="#24543d", secondary="#375747", accent="#87ba9c",
     foreground="#efefed", background="#121412", surface="#1a1e1a", panel="#202620",
@@ -78,6 +81,8 @@ class ChatState:
     project_id: str | None = None
     model: str = ""
     effort: str = ""
+    server_model: str = ""
+    server_effort: str = ""
     permission: str = ""
     usage: dict = field(default_factory=dict)
     attachments: list = field(default_factory=list)
@@ -89,6 +94,8 @@ class ChatState:
     active_turn: str | None = None
     busy: bool = False
     awaiting_turn: bool = False
+    compacting: bool = False
+    compact_status: str = ""
     asking_enabled: bool = False
     loaded: bool = False
     history_cursor: str | None = None
@@ -146,6 +153,7 @@ class CodexLight(App):
         self.list_stamp = None
         self.last_full_poll = 0.0
         self.pasting = False
+        self.btw = BtwPanel()
         self.desktop_state_path = Path(codex_environment().get("CODEX_HOME") or Path.home() / ".codex") / ".codex-global-state.json"
 
     def compose(self) -> ComposeResult:
@@ -156,6 +164,7 @@ class CodexLight(App):
             yield Button("用量", id="quota")
             yield Button("桌面 ↗", id="desktop")
             yield Button("ChatGPT ↗", id="chatgpt")
+            yield Button("BTW ▸", id="btw-toggle", tooltip="展开或收起右侧支线")
         with Horizontal(id="body"):
             with Vertical(id="sidebar"):
                 yield Input(placeholder="搜索聊天标题", id="search")
@@ -170,13 +179,14 @@ class CodexLight(App):
                     yield Label("选中一条聊天继续", id="thread-title")
                     yield Button("待回答", id="pending-request")
                     yield Button("更早消息", id="more-turns", disabled=True)
-                yield VerticalScroll(id="history")
+                yield TranscriptPane("history")
                 yield Static("", id="live", markup=False)
                 yield Label("", id="activity", markup=False)
                 yield Label("", id="attachments", markup=False)
+                yield OptionList(id="slash-commands")
                 yield Composer(id="prompt", placeholder="输入消息")
                 with Horizontal(id="compose-actions"):
-                    yield Label("Enter 发送 · Shift+Enter 换行", id="compose-hint")
+                    yield Label("Enter 发送 · Shift+Enter 换行 · / 命令", id="compose-hint")
                     yield Button("附件", id="attach")
                     yield Button("粘贴图", id="paste-image", tooltip="粘贴 Windows 剪贴板中的图片")
                     yield Button("移除", id="remove-attachment", disabled=True, tooltip="选择一项待发送附件移除")
@@ -184,6 +194,7 @@ class CodexLight(App):
                     yield Button("看图", id="image")
                     yield Button("停止", id="stop", disabled=True)
                     yield Button("发送", id="send", variant="primary", disabled=True)
+            yield self.btw
         yield Label("正在连接本机 Codex…", id="status", markup=False)
         with Horizontal(id="bottom-bar"):
             yield Button("⚙ 设置", id="settings", tooltip="会话权限 · F2")
@@ -200,6 +211,9 @@ class CodexLight(App):
         self.query_one("#activity").display = False
         self.query_one("#attachments").display = False
         self.query_one("#pending-request").display = False
+        self.query_one("#slash-commands").display = False
+        self.btw.display = False
+        self.btw.update_controls()
         self.set_interval(0.15, self.render_live)
         self.set_interval(0.35, self.render_activity)
         self.set_interval(1, self.sync_local)
@@ -236,11 +250,15 @@ class CodexLight(App):
                 self.status(error)
 
     def render_activity(self):
-        label = self.query_one("#activity", Label)
+        label = next(self.query("#activity").results(Label), None)
+        if label is None:
+            return
         label.display = self.connected and bool(self.chat.active_turn or self.chat.awaiting_turn)
         if label.display:
             dots = "..."[:self.activity_step % 3 + 1]
-            activity = "Codex 正在工作" if self.chat.active_turn else "正在等待 Codex 确认"
+            activity = "正在压缩上下文" if self.chat.compacting else (
+                "Codex 正在工作" if self.chat.active_turn else "正在等待 Codex 确认"
+            )
             label.update(Text(f"{activity}{dots}"))
             self.activity_step += 1
         else:
@@ -260,6 +278,7 @@ class CodexLight(App):
                 raise CodexError("桌面接力需要共享后端。")
             await self.backend.start()
             self.connected = True
+            self.btw.update_controls()
             self.update_send_controls()
             mode = "共享 Codex 后端" if self.backend.shared_url else "本机 Codex"
             resident = self.resident_label()
@@ -278,6 +297,7 @@ class CodexLight(App):
                 self.restore_subscriptions()
         except (CodexError, OSError) as error:
             self.connected = False
+            self.btw.update_controls()
             self.status(str(error))
             await self.backend.close()
             self.status(f"连接失败，草稿保留 · F5 重连 · {error}")
@@ -334,6 +354,9 @@ class CodexLight(App):
                 except (CodexError, OSError):
                     break
             rows.sort(key=lambda row: row.get("recencyAt") or row["updatedAt"], reverse=True)
+        self.btw.reload_index()
+        side_ids = self.btw.saved_threads()
+        rows = [row for row in rows if row["id"] not in side_ids]
         signature = [(r["id"], r.get("name"), r.get("preview"), r.get("cwd"), r.get("projectId")) for r in rows]
         previous = [(r["id"], r.get("name"), r.get("preview"), r.get("cwd"), r.get("projectId")) for r in self.rows]
         self.rows = rows
@@ -441,9 +464,10 @@ class CodexLight(App):
         log = self.query_one("#history", VerticalScroll)
         prompt = self.query_one("#prompt", TextArea)
         previous.draft = prompt.text
-        previous.scroll_y = log.scroll_y if log.max_scroll_y - log.scroll_y > 2 else None
+        previous.scroll_y = None if log.is_vertical_scroll_end else log.scroll_y
         self.chat = chat
         prompt.load_text(chat.draft)
+        self.btw.set_parent(chat.current.get("id"))
         self.project = chat.current.get("cwd")
         title = chat.current.get("name") or chat.current.get("preview") or "新聊天"
         self.query_one("#thread-title", Label).update(Text(clean_label(title)))
@@ -454,6 +478,8 @@ class CodexLight(App):
         self.render_attachments()
         self.update_usage()
         self.update_send_controls()
+        if chat.compact_status:
+            self.status(chat.compact_status)
         old_id = (previous.current or {}).get("id")
         if old_id and old_id in self.subscriptions and not previous.busy and not previous.requests:
             self.detach(old_id)
@@ -614,6 +640,8 @@ class CodexLight(App):
             if for_send:
                 params["config"] = QUESTION_CONFIG
             resumed = await self.backend.request("thread/resume", params)
+            chat.server_model = resumed.get("model") or resumed["thread"].get("model") or chat.server_model
+            chat.server_effort = resumed.get("reasoningEffort") or resumed["thread"].get("reasoningEffort") or chat.server_effort
             self.subscriptions.add(thread_id)
             chat.asking_enabled |= for_send
         if (resumed["thread"].get("status") or {}).get("type") == "active" and not chat.active_turn:
@@ -630,7 +658,7 @@ class CodexLight(App):
         chat.active_turn = turn_id
         if self.chat is chat:
             self.update_send_controls()
-            self.status("Codex 正在回复…")
+            self.status("正在压缩上下文…" if chat.compacting else "Codex 正在回复…")
         self.draw_tree(preserve_scroll=True)
 
     async def sync_transcript(self, recent):
@@ -641,7 +669,7 @@ class CodexLight(App):
             if not recent and not chat.messages:
                 return
             log = self.query_one("#history", VerticalScroll)
-            follow = log.max_scroll_y - log.scroll_y <= 2
+            follow = log.is_vertical_scroll_end
             position = log.scroll_y
             old = chat.messages
             overlap = min(len(old), len(recent))
@@ -704,54 +732,69 @@ class CodexLight(App):
             if self.chat is not chat:
                 return
             log = self.query_one("#history", VerticalScroll)
-            follow = log.max_scroll_y - log.scroll_y <= 2
             widget = self.transcript_widget(role, body)
             if overflow and log.children:
                 await log.children[0].remove()
             await log.mount(widget)
-            if follow and self.chat is chat:
-                self.call_after_refresh(log.scroll_end, animate=False)
 
     def render_live(self):
+        self.btw.render_live()
         if self.live_dirty:
             self.live_dirty = False
-            widget = self.query_one("#live", Static)
+            widget = next(self.query("#live").results(Static), None)
+            if widget is None:
+                return
             preview = "\n".join(self.chat.live.values())[-2300:]
             widget.display = bool(preview)
             if preview:
                 widget.update(markdown(preview))
 
     def update_usage(self):
-        fields = []
-        if self.chat.current:
-            for key, name in (("last", "本次缓存"), ("total", "会话缓存")):
-                tokens = self.chat.usage.get(key, {})
-                count = tokens.get("inputTokens", 0)
-                if count:
-                    fields.append(f"{name} {tokens.get('cachedInputTokens', 0) / count:.1%}")
-        for key in ("primary", "secondary"):
-            window = self.quota.get(key)
-            if window:
-                minutes = window.get("windowDurationMins") or 0
-                label = f"{minutes // 60}h" if minutes >= 60 and minutes % 60 == 0 else f"{minutes}m"
-                reset = window.get("resetsAt")
-                when = f" · {datetime.fromtimestamp(reset):%m-%d %H:%M}重置" if reset else ""
-                fields.append(f"{label}额度已用 {window['usedPercent']}%{when}")
+        fields = self.cache_lines(self.chat) + self.quota_lines()
         if self.chat.permission:
             fields.append("只读" if self.chat.permission == "readOnly" else "工作区写入")
         self.query_one("#usage-line", Label).update(Text("  │  ".join(fields)))
         model, info = self.effective_model()
-        saved = (self.chat.current or {}).get("reasoningEffort") if not self.chat.model else None
-        effort = self.chat.effort or saved or info.get("defaultReasoningEffort") or "思考强度"
+        effort = self.effective_effort(self.chat, info)
         self.query_one("#model-picker", Button).label = Text((info.get("displayName") or model or "模型")[:24] + " ▾")
-        self.query_one("#effort-picker", Button).label = Text(effort + " ▾")
+        self.query_one("#effort-picker", Button).label = Text((effort or "思考强度") + " ▾")
 
-    def effective_model(self):
-        current = self.chat.model or (self.chat.current or {}).get("model")
-        if current:
-            return current, next((m for m in self.models if m["model"] == current), {})
-        info = next((m for m in self.models if m.get("isDefault")), {})
-        return info.get("model"), info
+    def cache_lines(self, chat):
+        fields = []
+        for key, name in (("last", "本次缓存"), ("total", "会话缓存")):
+            tokens = chat.usage.get(key) or {}
+            count = tokens.get("inputTokens")
+            cached = tokens.get("cachedInputTokens")
+            if count and cached is not None:
+                fields.append(f"{name} {cached / count:.1%}")
+        return fields
+
+    def quota_lines(self):
+        fields = []
+        for key in ("primary", "secondary"):
+            window = self.quota.get(key)
+            if window and window.get("usedPercent") is not None:
+                minutes = window.get("windowDurationMins") or 0
+                label = (f"{minutes // 60}h" if minutes >= 60 and minutes % 60 == 0 else f"{minutes}m") if minutes else ""
+                reset = window.get("resetsAt")
+                when = f" · {datetime.fromtimestamp(reset):%m-%d %H:%M}重置" if reset else ""
+                fields.append(f"{label}额度已用 {window['usedPercent']}%{when}")
+        return fields
+
+    def model_info(self, model=None):
+        if model:
+            return next((m for m in self.models if m["model"] == model), {})
+        return next((m for m in self.models if m.get("isDefault")), {})
+
+    def effective_model(self, chat=None):
+        chat = chat or self.chat
+        current = chat.model or chat.server_model or (chat.current or {}).get("model")
+        info = self.model_info(current)
+        return current or info.get("model"), info
+
+    def effective_effort(self, chat, info):
+        saved = (chat.server_effort or (chat.current or {}).get("reasoningEffort")) if not chat.model else None
+        return chat.effort or saved or info.get("defaultReasoningEffort")
 
     def render_attachments(self):
         widget = self.query_one("#attachments", Label)
@@ -839,7 +882,8 @@ class CodexLight(App):
             self.open_thread(self.chat.current["id"])
 
     async def action_close_client(self):
-        if not self.backend.shared_url and any(chat.busy for chat in [self.chat, *self.chats.values(), *self.drafts.values()]):
+        if not self.backend.shared_url and any(
+                chat.busy for chat in [self.chat, *self.chats.values(), *self.drafts.values(), *self.btw.chats.values()]):
             self.status("请先停止或等待当前回复，再退出。")
             return
         self.closing = True
@@ -866,37 +910,58 @@ class CodexLight(App):
                 self.update_usage()
 
     @work(exclusive=True, group="model-picker")
-    async def choose_model_setting(self, kind):
+    async def choose_model_setting(self, kind, *, side=None):
         if not self.connected:
             return
+        target = side or self.chat
         if not self.models:
             try:
                 self.status("正在读取账号可用模型…")
-                response = await self.backend.request("model/list", {"limit": 80})
-                self.models = response["data"]
+                await self.load_model_catalog()
                 self.status(self.project or "已读取可用模型。")
             except (CodexError, OSError) as error:
                 self.status(error)
                 return
-        effective, info = self.effective_model()
-        if kind == "model":
-            choices = [("沿用会话 / 默认模型", "")]
-            choices.extend((m.get("displayName") or m["model"], m["model"]) for m in self.models)
-            selected = await self.push_screen_wait(Picker("选择模型", choices, self.chat.model or effective))
-            if selected is None:
-                return
-            self.chat.model = selected
-            _, info = self.effective_model()
-            supported = {e["reasoningEffort"] for e in info.get("supportedReasoningEfforts", [])}
-            if self.chat.effort not in supported:
-                self.chat.effort = ""
+        visible_target = self.btw.current if side else self.chat
+        if target is not visible_target or self.screen is not self.screen_stack[0]:
+            return
+        if side:
+            inherited, inherited_info = self.effective_model()
+            effective = target.model or inherited
+            info = self.model_info(effective) if target.model else inherited_info
         else:
-            choices = [("沿用会话 / 模型默认", "")]
-            choices.extend((e["reasoningEffort"], e["reasoningEffort"]) for e in info.get("supportedReasoningEfforts", []))
-            selected = await self.push_screen_wait(Picker("选择思考强度", choices, self.chat.effort))
+            effective, info = self.effective_model(target)
+            inherited = target.server_model or (target.current or {}).get("model")
+        caption = "BTW · " if side else ""
+        if kind == "model":
+            choices = [("沿用主对话" if side else "沿用会话 / 默认模型", "")]
+            choices.extend((m.get("displayName") or m["model"], m["model"]) for m in self.models)
+            selected = await self.push_screen_wait(Picker(caption + "选择模型", choices, target.model if side else target.model or effective))
             if selected is None:
                 return
-            self.chat.effort = selected
+            target.model = selected
+            info = self.model_info(selected or inherited)
+            supported = {e["reasoningEffort"] for e in info.get("supportedReasoningEfforts", [])}
+            if target.effort not in supported:
+                target.effort = ""
+        else:
+            choices = [("沿用主对话 / 所选模型默认" if side else "沿用会话 / 模型默认", "")]
+            choices.extend((e["reasoningEffort"], e["reasoningEffort"]) for e in info.get("supportedReasoningEfforts", []))
+            selected = await self.push_screen_wait(Picker(caption + "选择思考强度", choices, target.effort))
+            if selected is None:
+                return
+            target.effort = selected
+        if side:
+            self.btw.save_settings(target)
+        else:
+            self.update_usage()
+
+    async def load_model_catalog(self):
+        self.models = (await self.backend.request("model/list", {"limit": 80}))["data"]
+
+    async def read_quota(self):
+        response = await self.backend.request("account/rateLimits/read")
+        self.quota = response.get("rateLimits") or {}
         self.update_usage()
 
     @work
@@ -904,12 +969,48 @@ class CodexLight(App):
         if not self.connected:
             return
         try:
-            response = await self.backend.request("account/rateLimits/read")
-            self.quota = response["rateLimits"] or {}
-            self.update_usage()
+            await self.read_quota()
             self.status("已刷新额度。" if self.quota else "账号未返回额度数据。")
         except (CodexError, OSError) as error:
             self.status(error)
+
+    def status_detail(self, chat, quota_state=""):
+        connection = "未连接"
+        if self.connected:
+            connection = "共享后端" if self.backend.shared_url else "本机独立后端"
+        elif self.connecting:
+            connection = "连接中"
+        model, info = self.effective_model(chat)
+        title = (chat.current or {}).get("name") or (chat.current or {}).get("preview")
+        title = clean_label(title) if title else "未选择聊天" if not chat.current else "未命名聊天"
+        fields = [f"连接 · {connection}", f"聊天 · {title}",
+                  f"模型 · {info.get('displayName') or model or '沿用 Codex 设置'}",
+                  f"思考强度 · {self.effective_effort(chat, info) or '沿用 Codex 设置'}"]
+        fields.extend(self.cache_lines(chat) or ["缓存命中率 · 暂无数据"])
+        limits = self.quota_lines()
+        if limits and (quota_state or not self.connected):
+            fields.append("额度 · 上次读取值")
+        fields.extend(limits or ["账号额度 · 暂无数据"])
+        if quota_state:
+            fields.append(quota_state)
+        return "\n".join(fields)
+
+    @work(exclusive=True, group="status")
+    async def show_status(self):
+        if self.screen is not self.screen_stack[0]:
+            return
+        chat = self.chat
+        refresh = self.connected
+        dialog = StatusDialog(self.status_detail(chat, "正在刷新账号额度…" if refresh else ""))
+        await self.push_screen(dialog)
+        if refresh:
+            detail = ""
+            try:
+                await self.read_quota()
+            except (CodexError, OSError) as error:
+                detail = f"额度刷新失败：{error}"
+            if self.screen is dialog:
+                dialog.update_detail(self.status_detail(chat, detail))
 
     @work
     async def file_action(self, mode):
@@ -1003,6 +1104,8 @@ class CodexLight(App):
         clicked = event.button.id
         if clicked == "sidebar-toggle":
             self.action_sidebar()
+        elif clicked == "btw-toggle":
+            self.set_btw_visible(not self.btw.display)
         elif clicked == "refresh":
             self.action_refresh()
         elif clicked == "more-turns" and self.chat.current:
@@ -1074,9 +1177,108 @@ class CodexLight(App):
         except (ValueError, OSError) as error:
             self.status(error)
 
+    def set_btw_visible(self, visible):
+        if visible:
+            self.btw.open()
+        else:
+            self.btw.display = False
+            self.query_one("#prompt", TextArea).focus()
+        self.query_one("#btw-toggle", Button).label = "BTW ◂" if visible else "BTW ▸"
+
+    @on(TextArea.Changed, "#prompt")
+    def update_slash_menu(self, event):
+        menu = self.query_one("#slash-commands", OptionList)
+        text = event.text_area.text
+        choices = [Option(f"{key}   {label}", id=key) for key, label in SLASH_COMMANDS.items()
+                   if text.startswith("/") and key.startswith(text)]
+        menu.clear_options().add_options(choices)
+        menu.display = bool(choices)
+        menu.highlighted = 0 if choices else None
+
+    def slash_menu_key(self, key):
+        menu = self.query_one("#slash-commands", OptionList)
+        if not menu.display:
+            return False
+        if key == "up":
+            menu.action_cursor_up()
+        elif key == "down":
+            menu.action_cursor_down()
+        elif key == "escape":
+            menu.display = False
+        else:
+            return False
+        return True
+
+    @on(OptionList.OptionSelected, "#slash-commands")
+    def slash_selected(self, event):
+        self.run_slash_command(event.option.id)
+
+    def run_slash_command(self, command, argument=""):
+        prompt = self.query_one("#prompt", TextArea)
+        if command == "/btw":
+            self.set_btw_visible(True)
+            if argument and not self.btw.open(argument):
+                self.status("右栏暂不能发送，命令输入已保留。请检查连接、主聊天或右栏草稿。")
+                return
+        elif command == "/compact":
+            self.compact_chat(self.chat)
+            prompt.focus()
+        elif command == "/status":
+            self.show_status()
+            prompt.focus()
+        prompt.clear()
+        self.query_one("#slash-commands").display = False
+
+    def compact_feedback(self, chat, message):
+        chat.compact_status = message
+        if self.chat is chat:
+            self.status(message)
+
+    @work
+    async def compact_chat(self, chat):
+        tid = (chat.current or {}).get("id")
+        if not tid or not self.connected or self.connecting:
+            self.compact_feedback(chat, "请先连接后端并打开一条已保存的聊天。")
+            return
+        if chat.busy:
+            self.compact_feedback(chat, "这条聊天正在运行，结束后可压缩。")
+            return
+        chat.busy = chat.awaiting_turn = True
+        if self.chat is chat:
+            self.update_send_controls()
+        try:
+            fresh = await self.backend.request("thread/read", {"threadId": tid})
+            if (fresh["thread"].get("status") or {}).get("type") == "active":
+                self.reset_turn(chat)
+                self.compact_feedback(chat, "这条聊天正在运行，结束后可压缩。")
+                return
+            await self.subscribe_chat(chat)
+            if chat.active_turn:
+                self.compact_feedback(chat, "这条聊天正在运行，结束后可压缩。")
+                return
+            chat.compacting = True
+            self.compact_feedback(chat, "正在压缩上下文…")
+            await self.backend.request("thread/compact/start", {"threadId": tid})
+        except (CodexError, OSError) as error:
+            if not chat.active_turn:
+                self.reset_turn(chat)
+            self.compact_feedback(chat, f"压缩未确认：{error}" if isinstance(error, ConnectionInterrupted)
+                                  else f"压缩失败：{error}")
+            self.detach(tid)
+
     @work
     async def action_send_prompt(self):
         chat = self.chat
+        prompt = self.query_one("#prompt", TextArea)
+        parts = prompt.text.split(maxsplit=1)
+        if prompt.text.startswith("/") and "\n" not in prompt.text and parts and (
+                parts[0] == "/btw" or (len(parts) == 1 and parts[0] in SLASH_COMMANDS)):
+            self.run_slash_command(parts[0], parts[1] if len(parts) > 1 else "")
+            return
+        menu = self.query_one("#slash-commands", OptionList)
+        if menu.display and menu.highlighted_option and menu.highlighted_option.id.startswith(prompt.text):
+            self.run_slash_command(menu.highlighted_option.id)
+            return
         if not chat.current:
             self.status("先选择一条聊天或新建聊天。")
             return
@@ -1099,6 +1301,7 @@ class CodexLight(App):
         files = list(chat.attachments)
         if not text and not files:
             return
+        chat.compact_status = ""
         chat.busy = chat.awaiting_turn = True
         self.update_send_controls()
         self.status("正在向 Codex 发送…")
@@ -1141,12 +1344,18 @@ class CodexLight(App):
                 started = await self.backend.request("thread/start", start)
                 chat.current = started["thread"]
                 tid = chat.current["id"]
+                if self.chat is chat:
+                    self.btw.set_parent(tid)
                 self.chats[tid] = chat
                 self.subscriptions.add(tid)
                 chat.asking_enabled = True
                 self.drafts = {key: value for key, value in self.drafts.items() if value is not chat}
             submitting = True
             result = await self.backend.request("turn/start", {**params, "threadId": tid})
+            if params.get("model") and params["model"] != chat.server_model:
+                chat.server_model = params["model"]
+                chat.server_effort = ""
+            chat.server_effort = params.get("effort") or chat.server_effort
             if chat.awaiting_turn and result.get("turn"):
                 self.mark_turn_started(chat, result["turn"]["id"])
         except (CodexError, OSError) as error:
@@ -1185,6 +1394,7 @@ class CodexLight(App):
 
     def reset_turn(self, chat):
         chat.busy = chat.awaiting_turn = False
+        chat.compacting = False
         chat.active_turn = None
         chat.file_changes.clear()
         chat.live.clear()
@@ -1230,6 +1440,9 @@ class CodexLight(App):
             return
         method, params = event["method"], event.get("params") or {}
         tid = params.get("threadId")
+        if tid in self.btw.threads:
+            await self.btw.backend_event(tid, event)
+            return
         chat = self.chats.get(tid)
         if "id" in event:
             if method not in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval",
@@ -1251,6 +1464,7 @@ class CodexLight(App):
             return
         if method == "connection/closed":
             self.connected = False
+            self.btw.disconnected()
             self.query_one("#title", Label).tooltip = None
             self.subscriptions.clear()
             for tid, state in self.chats.items():
@@ -1258,6 +1472,8 @@ class CodexLight(App):
                     self.reconnect_threads.add(tid)
                 state.requests.clear()
                 state.asking_enabled = False
+                if state.compacting:
+                    state.compact_status = "压缩结果未确认 · 连接已断开"
                 self.reset_turn(state)
             self.dismiss_request_dialog()
             self.requests_changed(self.chat)
@@ -1304,9 +1520,14 @@ class CodexLight(App):
                     return
                 if current:
                     error = result.get("error") or {}
-                    self.status(error.get("message") or {
-                        "completed": "回复完成", "interrupted": "已停止", "failed": "回复失败",
-                    }.get(result["status"], result["status"]))
+                    if not chat.compacting:
+                        self.status(error.get("message") or {
+                            "completed": "回复完成", "interrupted": "已停止", "failed": "回复失败",
+                        }.get(result["status"], result["status"]))
+                if chat.compacting:
+                    status = result["status"]
+                    detail = (result.get("error") or {}).get("message") or status
+                    self.compact_feedback(chat, "上下文压缩完成" if status == "completed" else f"压缩未完成：{detail}")
                 for request_id, request in list(chat.requests.items()):
                     if (request.get("params") or {}).get("turnId") == result["id"]:
                         self.resolve_request(chat, request_id, changed=False)

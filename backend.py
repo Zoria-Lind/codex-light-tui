@@ -51,6 +51,9 @@ def codex_executable(env):
     raise CodexError("找不到 Codex。请将 CODEX_LIGHT_EXE 指向官方 codex.exe。")
 
 
+CLIENT_VERSION = "0.2.0"
+
+
 class Backend:
     def __init__(self, on_event, *, shared_url=None):
         self.on_event = on_event
@@ -88,7 +91,7 @@ class Backend:
             )
         self.reader = asyncio.create_task(self.read_messages())
         await self.request("initialize", {
-            "clientInfo": {"name": "codex_light_tui", "title": "Codex Light TUI", "version": "0.1.0"},
+            "clientInfo": {"name": "codex_light_tui", "title": "Codex Light TUI", "version": CLIENT_VERSION},
             "capabilities": {"experimentalApi": True},
         })
         await self.send({"method": "initialized"})

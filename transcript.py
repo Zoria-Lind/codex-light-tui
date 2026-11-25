@@ -13,14 +13,48 @@ from rich.cells import cell_len
 from rich.text import Text
 from rich.console import Group
 from rich.markdown import Markdown
+from textual import on
 from textual.binding import Binding
 from textual.content import Content
-from textual.containers import Vertical
-from textual.widgets import Static
+from textual.containers import Vertical, VerticalScroll
+from textual.widgets import Button, Static
 
 
 DETAIL_LIMIT = 8_000
 WRAPPED_SHELL = re.compile(r'^"[^"\r\n]+"\s+-(?:Command|c)\s+', re.I)
+
+
+class TranscriptPane(Vertical):
+    def __init__(self, history_id):
+        super().__init__(classes="transcript-pane")
+        self.history = VerticalScroll(id=history_id)
+        self.latest = Button("↓", id=f"{history_id}-latest", classes="transcript-latest",
+                             tooltip="回到最新消息")
+
+    def compose(self):
+        yield self.history
+        yield self.latest
+
+    def on_mount(self):
+        self.history.anchor()
+        self.watch(self.history, "scroll_y", self.update_latest, init=False)
+        self.watch(self.history, "virtual_size", self.schedule_latest, init=False)
+
+    def on_resize(self):
+        self.latest.styles.offset = (max(0, self.size.width - 8), -1)
+        self.schedule_latest()
+
+    def schedule_latest(self):
+        self.call_after_refresh(self.update_latest)
+
+    def update_latest(self):
+        self.latest.display = not self.history.is_vertical_scroll_end
+
+    @on(Button.Pressed, ".transcript-latest")
+    def jump_latest(self, event):
+        event.stop()
+        self.history.scroll_end(animate=False, immediate=True, x_axis=False)
+        self.update_latest()
 
 
 def limited(text, limit=DETAIL_LIMIT):

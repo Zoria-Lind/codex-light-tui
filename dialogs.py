@@ -61,6 +61,23 @@ class Picker(CancellableDialog):
         self.dismiss(self.choices[event.option_index][1])
 
 
+class StatusDialog(CancellableDialog):
+    def __init__(self, detail):
+        super().__init__()
+        self.detail = detail
+
+    def compose(self):
+        with Vertical(classes="dialog"):
+            yield Label("状态 · 当前主聊天")
+            with VerticalScroll(classes="dialog-body"):
+                yield Static(Text(self.detail), id="status-details")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("关闭", id="cancel-dialog", variant="primary")
+
+    def update_detail(self, detail):
+        self.query_one("#status-details", Static).update(Text(detail))
+
+
 class PathDialog(CancellableDialog):
     def __init__(self, root, images, mode):
         super().__init__()

@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 
-from backend import codex_environment, codex_executable
+from backend import CLIENT_VERSION, codex_environment, codex_executable
 from shared_state import read_endpoint
 
 
@@ -22,7 +22,7 @@ async def verify_connection(address, token):
                        proxy=None, open_timeout=4, close_timeout=1) as socket:
         async with asyncio.timeout(5):
             await socket.send(json.dumps({"id": 1, "method": "initialize", "params": {
-                "clientInfo": {"name": "codex_light_cli_probe", "title": "Codex CLI connection check", "version": "0.1.0"},
+                "clientInfo": {"name": "codex_light_cli_probe", "title": "Codex CLI connection check", "version": CLIENT_VERSION},
             }}))
             async for raw in socket:
                 message = json.loads(raw)

@@ -2,6 +2,7 @@
 .schema/
 .ui-state.json*
 .ui-state.tmp
+.btw-state.*
 .pasted-images/
 .shared-runtime/
 __pycache__/
